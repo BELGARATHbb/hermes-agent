@@ -41,6 +41,10 @@ class OpenAICodexAdapter(UpstreamAdapter):
         return True
 
     @property
+    def requires_client_auth(self) -> bool:
+        return True
+
+    @property
     def allowed_paths(self) -> FrozenSet[str]:
         return _ALLOWED_PATHS
 

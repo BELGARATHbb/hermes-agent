@@ -86,6 +86,11 @@ class UpstreamAdapter(ABC):
         """Whether this credential must never bind beyond loopback."""
         return False
 
+    @property
+    def requires_client_auth(self) -> bool:
+        """Whether callers must authenticate before credentials are resolved."""
+        return False
+
     def get_owned_upstream_header_names(self) -> frozenset[str]:
         """Headers whose inbound client values must always be removed."""
         return frozenset()

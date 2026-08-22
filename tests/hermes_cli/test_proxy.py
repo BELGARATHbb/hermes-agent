@@ -255,6 +255,7 @@ class FakeAdapter(UpstreamAdapter):
         self._upstream_headers = dict(upstream_headers or {})
         self._owned_headers = frozenset(owned_headers or self._upstream_headers)
         self.calls = 0
+        self.auth_checks = 0
         self.retry_calls = 0
 
     @property
@@ -266,7 +267,9 @@ class FakeAdapter(UpstreamAdapter):
     @property
     def allowed_paths(self): return self._allowed
 
-    def is_authenticated(self): return True
+    def is_authenticated(self):
+        self.auth_checks += 1
+        return True
 
     def get_credential(self):
         self.calls += 1
@@ -475,6 +478,99 @@ def test_server_strips_client_auth_header():
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_requires_client_authority_before_resolving_upstream_credential():
+    """Local reachability alone must not authorize subscription spending."""
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(
+            _build_fake_upstream(captured)
+        )
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="upstream-secret")
+        proxy_runner, proxy_base = await _start_runner(
+            create_app(adapter, client_auth_token="owner-client-secret")
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                for headers in (
+                    {},
+                    {"Authorization": "Bearer wrong-secret"},
+                ):
+                    async with session.post(
+                        f"{proxy_base}/v1/chat/completions",
+                        json={"model": "test"},
+                        headers=headers,
+                    ) as resp:
+                        body = await resp.json()
+                        assert resp.status == 401
+                        assert body["error"]["code"] == "proxy_auth_failed"
+
+                assert adapter.calls == 0
+                assert captured["requests"] == []
+
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={"model": "test"},
+                    headers={
+                        "Authorization": "Bearer owner-client-secret",
+                    },
+                ) as resp:
+                    assert resp.status == 200
+                    await resp.read()
+
+            assert adapter.calls == 1
+            assert captured["requests"][0]["auth"] == "Bearer upstream-secret"
+            assert "owner-client-secret" not in captured["requests"][0]["auth"]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_health_requires_client_authority_before_reading_auth_state():
+    """Protected health checks must not touch credential-pool state first."""
+
+    async def run():
+        adapter = FakeAdapter("http://127.0.0.1:1/v1")
+        proxy_runner, proxy_base = await _start_runner(
+            create_app(adapter, client_auth_token="owner-client-secret")
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                for headers in (
+                    {},
+                    {"Authorization": "Bearer wrong-secret"},
+                ):
+                    async with session.get(
+                        f"{proxy_base}/health",
+                        headers=headers,
+                    ) as resp:
+                        body = await resp.json()
+                        assert resp.status == 401
+                        assert body["error"]["code"] == "proxy_auth_failed"
+
+                assert adapter.auth_checks == 0
+                assert adapter.calls == 0
+
+                async with session.get(
+                    f"{proxy_base}/health",
+                    headers={
+                        "Authorization": "Bearer owner-client-secret",
+                    },
+                ) as resp:
+                    body = await resp.json()
+                    assert resp.status == 200
+                    assert body["authenticated"] is True
+
+                assert adapter.auth_checks == 1
+                assert adapter.calls == 0
+        finally:
+            await proxy_runner.cleanup()
 
     asyncio.run(run())
 

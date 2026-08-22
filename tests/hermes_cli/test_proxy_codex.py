@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.adapters.codex import OpenAICodexAdapter
-from hermes_cli.proxy.cli import cmd_proxy_start
-from hermes_cli.proxy.server import is_loopback_host, run_server
+from hermes_cli.proxy.cli import _read_client_auth_token, cmd_proxy_start
+from hermes_cli.proxy.server import create_app, is_loopback_host, run_server
 
 
 def _jwt_with_account(account_id: str = "acct-123") -> str:
@@ -59,6 +62,97 @@ def test_codex_loopback_host_validation_and_cli_rejection(capsys):
     assert "loopback-only" in capsys.readouterr().err
 
 
+def test_codex_cli_requires_owner_only_client_auth_file(tmp_path, capsys):
+    adapter = OpenAICodexAdapter()
+    args = SimpleNamespace(
+        provider="codex",
+        host="127.0.0.1",
+        port=8645,
+        auth_token_file=None,
+    )
+    with (
+        patch("hermes_cli.proxy.cli.get_adapter", return_value=adapter),
+        patch.object(adapter, "is_authenticated", return_value=True),
+        patch("hermes_cli.proxy.cli.run_server") as run,
+    ):
+        assert cmd_proxy_start(args) == 2
+    run.assert_not_called()
+    assert "--auth-token-file" in capsys.readouterr().err
+
+    token_file = tmp_path / "proxy-token"
+    token_file.write_text("owner-client-secret\n", encoding="utf-8")
+    if os.name != "nt":
+        token_file.chmod(0o644)
+        with pytest.raises(ValueError, match="owner-only"):
+            _read_client_auth_token(str(token_file))
+        token_file.chmod(0o600)
+
+    assert _read_client_auth_token(str(token_file)) == "owner-client-secret"
+
+
+def test_codex_cli_passes_client_authority_without_logging_it(tmp_path, capsys):
+    token_file = tmp_path / "proxy-token"
+    token_file.write_text("owner-client-secret\n", encoding="utf-8")
+    if os.name != "nt":
+        token_file.chmod(0o600)
+
+    adapter = OpenAICodexAdapter()
+    captured = {}
+
+    async def fake_run_server(adapter_arg, **kwargs):
+        captured["adapter"] = adapter_arg
+        captured.update(kwargs)
+
+    args = SimpleNamespace(
+        provider="codex",
+        host="127.0.0.1",
+        port=18645,
+        auth_token_file=str(token_file),
+    )
+    with (
+        patch("hermes_cli.proxy.cli.get_adapter", return_value=adapter),
+        patch.object(adapter, "is_authenticated", return_value=True),
+        patch("hermes_cli.proxy.cli.run_server", side_effect=fake_run_server),
+    ):
+        assert cmd_proxy_start(args) == 0
+
+    assert captured == {
+        "adapter": adapter,
+        "host": "127.0.0.1",
+        "port": 18645,
+        "client_auth_token": "owner-client-secret",
+    }
+    assert "owner-client-secret" not in capsys.readouterr().err
+
+
+def test_client_auth_file_rejects_symlink_and_empty_file(tmp_path):
+    empty = tmp_path / "empty-token"
+    empty.write_text("\n", encoding="utf-8")
+    if os.name != "nt":
+        empty.chmod(0o600)
+    with pytest.raises(ValueError, match="empty"):
+        _read_client_auth_token(str(empty))
+
+    multiline = tmp_path / "multiline-token"
+    multiline.write_text("first\nsecond\n", encoding="utf-8")
+    if os.name != "nt":
+        multiline.chmod(0o600)
+    with pytest.raises(ValueError, match="without whitespace"):
+        _read_client_auth_token(str(multiline))
+
+    target = tmp_path / "real-token"
+    target.write_text("secret", encoding="utf-8")
+    if os.name != "nt":
+        target.chmod(0o600)
+    link = tmp_path / "token-link"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable on this platform")
+    with pytest.raises(ValueError, match="regular file"):
+        _read_client_auth_token(str(link))
+
+
 def test_codex_server_rejects_non_loopback_programmatic_bind():
     adapter = OpenAICodexAdapter()
     try:
@@ -67,6 +161,16 @@ def test_codex_server_rejects_non_loopback_programmatic_bind():
         assert "loopback-only" in str(exc)
     else:
         raise AssertionError("programmatic non-loopback Codex bind was accepted")
+
+
+def test_codex_server_requires_client_authority_programmatically():
+    adapter = OpenAICodexAdapter()
+    with pytest.raises(RuntimeError, match="client authentication"):
+        create_app(adapter)
+
+
+def test_codex_adapter_declares_client_auth_requirement():
+    assert OpenAICodexAdapter().requires_client_auth is True
 
 
 def test_codex_adapter_authentication_is_pool_backed():

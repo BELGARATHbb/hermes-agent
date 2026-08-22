@@ -18,7 +18,7 @@ This is different from the [API server](./api-server.md):
 |---|---|---|
 | What it serves | Your agent (full toolset, memory, skills) | Raw model inference |
 | Use case | "Use Hermes as a chat backend" | "Use my Portal sub from another app" |
-| Auth | Your `API_SERVER_KEY` | Any bearer (proxy attaches the real one) |
+| Auth | Your `API_SERVER_KEY` | Provider-specific; Codex requires an owner-only client bearer |
 | Tool calls | Yes — the agent runs tools | No — passthrough only |
 
 Use the API server when you want the **agent** as a backend. Use the
@@ -83,11 +83,19 @@ interface in `hermes_cli/proxy/adapters/`.
 
 ### OpenAI Codex / ChatGPT OAuth
 
-Start the proxy from the Hermes profile that owns the Codex OAuth credential:
+Create a client bearer in an owner-only regular file, then start the proxy from
+the Hermes profile that owns the Codex OAuth credential:
 
 ```bash
-hermes proxy start --provider codex
+umask 077
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > ~/.hermes/codex-proxy.token
+hermes proxy start --provider codex \
+  --auth-token-file ~/.hermes/codex-proxy.token
 ```
+
+On POSIX systems the token file must be owned by the current user and have mode
+`0600`; symlinks are rejected. Keep its contents out of logs, command arguments,
+and source-controlled configuration.
 
 Codex forwards only `/v1/responses` and `/v1/models`. The adapter attaches the
 native Codex `originator`, `User-Agent`, and JWT-derived
@@ -100,13 +108,16 @@ Point a Responses-compatible client at:
 
 ```text
 Base URL: http://127.0.0.1:8645/v1
-API key:  any non-empty placeholder
+API key:  the bearer stored in ~/.hermes/codex-proxy.token
 Model:    a model available to your ChatGPT/Codex account
 Transport: OpenAI Responses API
 ```
 
-Keep this proxy on `127.0.0.1`. It accepts any inbound bearer and spends the
-OAuth account owned by the profile that started it.
+Keep this proxy on `127.0.0.1`. Loopback limits network reachability, while the
+required client bearer establishes authority to spend the OAuth account owned
+by the profile that started it. Missing or incorrect client credentials return
+HTTP 401 before Hermes reads credential-pool availability, resolves a bearer,
+or contacts the Codex upstream. This applies to `/health` as well as `/v1/*`.
 
 ## Check status
 
@@ -206,9 +217,9 @@ Use a firewall, VPN, or reverse proxy with proper auth if you expose
 this beyond your trusted network.
 
 The `openai-codex` adapter is stricter: it rejects every non-loopback bind,
-including `0.0.0.0`, because the proxy would otherwise expose a ChatGPT OAuth
-subscription to any reachable client. Codex must remain on `127.0.0.1`, `::1`,
-or `localhost`.
+including `0.0.0.0`, and requires an owner-only client bearer even on loopback.
+Loopback alone is not an identity boundary on a multi-user host. Codex must
+remain on `127.0.0.1`, `::1`, or `localhost`.
 
 ## Rate limits
 
@@ -221,10 +232,11 @@ subscription quota. Monitor usage at
 
 The proxy is intentionally minimal. Per request:
 
-1. Receive `POST /v1/chat/completions` from your app
-2. Look up the adapter's current credential (refresh if expiring)
-3. Forward the request body verbatim, with `Authorization: Bearer <minted-key>`
-4. Stream the response back unchanged (SSE preserved)
+1. Receive a request on an adapter-allowed `/v1/*` path
+2. Validate client authority when the adapter requires it
+3. Look up the adapter's current credential (refresh if expiring)
+4. Forward the request body verbatim, replacing `Authorization` with the upstream bearer
+5. Stream the response back unchanged (SSE preserved)
 
 No transformation. No logging of request bodies. No agent loop. The
 proxy is a credential-attaching pass-through.
