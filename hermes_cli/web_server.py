@@ -2036,11 +2036,15 @@ def _count_status_active_sessions() -> int:
 
     This machine-level status must include worker sessions owned by named
     profiles, not only the dashboard process's own ``state.db``.  Enumerate the
-    same cheap profile targets used by the cross-profile Sessions API, open
-    each existing store read-only, and aggregate an exact SQL count.  No
-    transcript, prompt, title, cwd, or credential data leaves SQLite.
+    same cheap profile targets used by the cross-profile Sessions API, open each
+    existing store through SessionDB's non-healing observational mode, and
+    aggregate an exact SQL count. Settled stores use SQLite ``immutable=1``;
+    live WAL stores reuse their existing read-only WAL/SHM path so uncheckpointed
+    sessions still count. No transcript, prompt, title, cwd, or credential data
+    leaves SQLite. Invalid/inaccessible stores are skipped without healing or
+    creating journal/WAL sidecars because this number is best-effort garnish.
     """
-    from hermes_state import _default_db_path
+    from hermes_state import SessionDB, _default_db_path
     from hermes_cli.profiles import profiles_to_serve
 
     # The heal helper bootstraps a missing store; this garnish must not — on
@@ -2062,14 +2066,21 @@ def _count_status_active_sessions() -> int:
             resolved_path = db_path.resolve()
         except OSError:
             resolved_path = db_path.absolute()
-        if resolved_path in seen_paths or not db_path.exists():
+        if resolved_path in seen_paths:
             continue
         seen_paths.add(resolved_path)
-        db = _open_session_db_at_path(db_path, read_only=True)
         try:
-            active_sessions += db.active_session_count(active_after=active_after)
-        finally:
-            db.close()
+            # stat() rejects missing/inaccessible targets before sqlite sees
+            # them. SessionDB's immutable path deliberately bypasses the shared
+            # healing helper used by interactive session reads.
+            db_path.stat()
+            db = SessionDB(db_path=db_path, read_only=True, immutable=True)
+            try:
+                active_sessions += db.active_session_count(active_after=active_after)
+            finally:
+                db.close()
+        except Exception as exc:
+            _log.debug("status count skipped unreadable state store: %s", exc)
     return active_sessions
 
 
