@@ -2034,30 +2034,43 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
 def _count_status_active_sessions() -> int:
     """Return the dashboard status active-session count.
 
-    This is best-effort status garnish, not a critical path.  Opens read-only
-    (via the shared stale-schema heal, same as every other dashboard read
-    path) so /api/status never routinely writes to state.db while another
-    Hermes process is using it.
+    This machine-level status must include worker sessions owned by named
+    profiles, not only the dashboard process's own ``state.db``.  Enumerate the
+    same cheap profile targets used by the cross-profile Sessions API, open
+    each existing store read-only, and aggregate an exact SQL count.  No
+    transcript, prompt, title, cwd, or credential data leaves SQLite.
     """
     from hermes_state import _default_db_path
+    from hermes_cli.profiles import profiles_to_serve
 
     # The heal helper bootstraps a missing store; this garnish must not — on
     # a fresh install /api/status polls would otherwise create state.db
     # before the user's first session.
-    if not Path(_default_db_path()).exists():
-        return 0
-
-    db = _open_session_db_for_profile(None, read_only=True)
     try:
-        sessions = db.list_sessions_rich(limit=50, compact_rows=True)
-        now = time.time()
-        return sum(
-            1 for s in sessions
-            if s.get("ended_at") is None
-            and (now - s.get("last_active", s.get("started_at", 0))) < 300
-        )
-    finally:
-        db.close()
+        targets = profiles_to_serve(multiplex=True)
+    except Exception:
+        targets = []
+    if not targets:
+        targets = [("default", Path(_default_db_path()).parent)]
+
+    active_after = time.time() - 300
+    active_sessions = 0
+    seen_paths: set[Path] = set()
+    for _profile, home in targets:
+        db_path = Path(home) / "state.db"
+        try:
+            resolved_path = db_path.resolve()
+        except OSError:
+            resolved_path = db_path.absolute()
+        if resolved_path in seen_paths or not db_path.exists():
+            continue
+        seen_paths.add(resolved_path)
+        db = _open_session_db_at_path(db_path, read_only=True)
+        try:
+            active_sessions += db.active_session_count(active_after=active_after)
+        finally:
+            db.close()
+    return active_sessions
 
 
 async def _status_active_sessions() -> int:

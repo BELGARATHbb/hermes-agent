@@ -12715,6 +12715,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
             return cursor.fetchone()[0]
 
+    def active_session_count(self, *, active_after: float) -> int:
+        """Count currently open, recently active top-level conversations.
+
+        This is the aggregate counterpart to the active-row projection used by
+        dashboard session lists.  Keeping the predicate in SQLite avoids
+        truncating the status count to an arbitrary list page and never reads
+        prompts or messages into Python.
+        """
+        where_clauses = [
+            _LISTABLE_CHILD_SQL,
+            f"{_delegate_from_json('s.model_config')} IS NULL",
+            "s.archived = 0",
+            "s.hidden = 0",
+            "s.ended_at IS NULL",
+            f"{_sql_session_last_active('s')} >= ?",
+        ]
+        with self._lock:
+            if self._conn is None:
+                raise RuntimeError("SessionDB connection is closed")
+            cursor = self._conn.execute(
+                f"SELECT COUNT(*) FROM sessions s WHERE {' AND '.join(where_clauses)}",
+                (float(active_after),),
+            )
+            return int(cursor.fetchone()[0])
+
     def session_count_ge(self, n: int = 1) -> bool:
         """Check if at least N sessions exist (archived included).
 
