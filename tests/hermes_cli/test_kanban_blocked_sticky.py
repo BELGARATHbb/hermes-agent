@@ -76,6 +76,31 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_initial_block_survives_parent_completion_until_explicit_unblock(
+    kanban_home: Path,
+) -> None:
+    """An initial operator hold is sticky across dependency recomputation."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = kb.create_task(
+            conn,
+            title="approval-gated child",
+            assignee="worker",
+            parents=[parent],
+            initial_status="blocked",
+        )
+
+        assert kb.claim_task(conn, parent, claimer="worker") is not None
+        assert kb.complete_task(conn, parent, result="done")
+
+        for _ in range(5):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, child).status == "blocked"
+
+        assert kb.unblock_task(conn, child)
+        assert kb.get_task(conn, child).status == "ready"
+
+
 
 
 # ---------------------------------------------------------------------------

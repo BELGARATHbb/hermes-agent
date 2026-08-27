@@ -4511,13 +4511,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        read_only: bool = False,
+        *,
+        immutable: bool = False,
+    ):
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
         _ensure_test_isolation(self.db_path)
+        if immutable and not read_only:
+            raise ValueError("immutable SessionDB opens must also be read-only")
         self.read_only = read_only
+        self.immutable = immutable
 
         self._lock = threading.Lock()
         # Read-path split (WAL only): recall/browse queries borrow a
@@ -4613,8 +4622,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
+                uri = f"file:{self.db_path}?mode=ro"
+                if immutable:
+                    # Refuse non-SQLite inputs before sqlite can attempt journal
+                    # handling. For a settled database, immutable=1 is the
+                    # strongest source-side guarantee: no locking, recovery, or
+                    # sidecars. A live WAL database is the one exception because
+                    # SQLite immutable mode intentionally ignores its WAL (and
+                    # would undercount active sessions). Reading an already-live
+                    # WAL through mode=ro is source-safe only when its SHM file
+                    # already exists; otherwise skip rather than create one.
+                    with Path(self.db_path).open("rb") as source:
+                        if source.read(16) != b"SQLite format 3\x00":
+                            raise sqlite3.DatabaseError("file is not a database")
+                    wal_path = Path(f"{self.db_path}-wal")
+                    if wal_path.exists():
+                        if not Path(f"{self.db_path}-shm").exists():
+                            raise sqlite3.OperationalError(
+                                "immutable read refused WAL without existing SHM"
+                            )
+                    else:
+                        uri += "&immutable=1"
                 self._conn = _connect_tracked_db(
-                    f"file:{self.db_path}?mode=ro",
+                    uri,
                     tracking_path=self.db_path,
                     uri=True,
                     check_same_thread=False,
@@ -4622,6 +4652,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                if immutable:
+                    initialization_complete = True
+                    return
                 # FTS capability flags normally come from writable schema
                 # initialisation. Probe existing virtual tables with SELECTs
                 # only so read-only search keeps its FTS and trigram paths.
@@ -13250,6 +13283,104 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._lock:
             cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
             return cursor.fetchone()[0]
+
+    def active_session_count(self, *, active_after: float) -> int:
+        """Count currently open, recently active top-level conversations.
+
+        This is the aggregate counterpart to the active-row projection used by
+        dashboard session lists.  Keeping the predicate in SQLite avoids
+        truncating the status count to an arbitrary list page and never reads
+        prompts or messages into Python.
+        """
+        # Seed the same logical rows as list_sessions_rich (roots plus
+        # user-visible branch/reset rows), then follow exactly one preferred
+        # compression continuation per hop. A continuation may inherit a
+        # branch/delegate marker from its logical root, so a marker disqualifies
+        # it only when it points at the parent edge being considered.
+        logical_seed_sql = f"""
+            (
+                s.parent_session_id IS NULL
+                OR json_extract(
+                    COALESCE(s.model_config, '{{}}'), '$._branched_from'
+                ) = s.parent_session_id
+                OR EXISTS (
+                    SELECT 1 FROM sessions branch_parent
+                    WHERE branch_parent.id = s.parent_session_id
+                      AND branch_parent.end_reason = 'branched'
+                      AND s.started_at >= branch_parent.ended_at
+                )
+                OR json_extract(
+                    COALESCE(s.model_config, '{{}}'), '$._reset_from'
+                ) = s.parent_session_id
+                OR {_legacy_reset_child_sql('s', _RESET_END_REASONS_SQL)}
+            )
+        """
+        query = f"""
+            WITH RECURSIVE
+            continuation_candidates(parent_id, child_id, preference) AS (
+                SELECT
+                    parent.id,
+                    child.id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY parent.id
+                        ORDER BY
+                            CASE
+                                WHEN child.end_reason = 'compression' THEN 0
+                                WHEN child.ended_at IS NULL THEN 1
+                                ELSE 2
+                            END,
+                            {_sql_session_last_active('child')} DESC,
+                            child.started_at DESC,
+                            child.id DESC
+                    )
+                FROM sessions parent
+                JOIN sessions child ON child.parent_session_id = parent.id
+                WHERE parent.end_reason = 'compression'
+                  AND COALESCE(
+                        json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from'),
+                        ''
+                      ) != parent.id
+                  AND COALESCE(
+                        json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from'),
+                        ''
+                      ) != parent.id
+                  AND COALESCE(child.source, '') != 'tool'
+            ),
+            chain(root_id, current_id, depth) AS (
+                SELECT s.id, s.id, 0
+                FROM sessions s
+                WHERE {logical_seed_sql}
+                UNION ALL
+                SELECT chain.root_id, candidate.child_id, chain.depth + 1
+                FROM chain
+                JOIN continuation_candidates candidate
+                  ON candidate.parent_id = chain.current_id
+                 AND candidate.preference = 1
+                WHERE chain.depth < 100
+            ),
+            tips(root_id, tip_id) AS (
+                SELECT chain.root_id, chain.current_id
+                FROM chain
+                WHERE chain.depth = (
+                    SELECT MAX(other.depth)
+                    FROM chain other
+                    WHERE other.root_id = chain.root_id
+                )
+            )
+            SELECT COUNT(*)
+            FROM tips
+            JOIN sessions tip ON tip.id = tips.tip_id
+            WHERE {_delegate_from_json('tip.model_config')} IS NULL
+              AND tip.archived = 0
+              AND tip.hidden = 0
+              AND tip.ended_at IS NULL
+              AND {_sql_session_last_active('tip')} >= ?
+        """
+        with self._lock:
+            if self._conn is None:
+                raise RuntimeError("SessionDB connection is closed")
+            cursor = self._conn.execute(query, (float(active_after),))
+            return int(cursor.fetchone()[0])
 
     def session_count_ge(self, n: int = 1) -> bool:
         """Check if at least N sessions exist (archived included).
