@@ -120,6 +120,49 @@ def test_repeated_crashes_truncates_huge_tracebacks():
     assert d.detail.endswith("…") or len(d.detail) < 700
 
 
+def test_repeated_crashes_clears_after_valid_blocked_handoff():
+    """A later protocol-compliant block makes old crashes historical."""
+    task = _task(status="triage")
+    runs = [
+        _run(outcome="crashed", run_id=1, error="boom one"),
+        _run(outcome="crashed", run_id=2, error="boom two"),
+        _run(outcome="blocked", run_id=3),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, [], runs)
+
+    assert not [d for d in diags if d.kind == "repeated_crashes"]
+
+
+def test_repeated_crashes_requires_contiguous_crashes_after_block():
+    """A block between crashes prevents a threshold-two crash streak."""
+    task = _task(status="triage")
+    runs = [
+        _run(outcome="crashed", run_id=1, error="old crash"),
+        _run(outcome="blocked", run_id=2),
+        _run(outcome="crashed", run_id=3, error="new crash"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, [], runs)
+
+    assert not [d for d in diags if d.kind == "repeated_crashes"]
+
+
+def test_repeated_crashes_still_fires_for_two_trailing_crashes():
+    task = _task(status="triage")
+    runs = [
+        _run(outcome="blocked", run_id=1),
+        _run(outcome="crashed", run_id=2, error="boom one"),
+        _run(outcome="crashed", run_id=3, error="boom two"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, [], runs)
+
+    repeated = [d for d in diags if d.kind == "repeated_crashes"]
+    assert len(repeated) == 1
+    assert repeated[0].count == 2
+
+
 # ---------------------------------------------------------------------------
 # Severity sorting
 # ---------------------------------------------------------------------------
