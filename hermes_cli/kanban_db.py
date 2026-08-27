@@ -79,6 +79,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -329,6 +330,10 @@ def _fire_dispatch_tick_hook(
         outcome = "ok"
         if result.skipped_locked:
             outcome = "skipped_locked"
+        elif result.capacity_gate_error:
+            outcome = "capacity_error"
+        elif result.capacity_limited or result.capacity_deferred:
+            outcome = "capacity_deferred"
         elif not any((
             result.spawned,
             result.reclaimed,
@@ -8467,6 +8472,23 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    capacity_limited: bool = False
+    """True when a concurrency, memory, or disk-capacity gate deferred work
+    this tick instead of attempting a worker spawn. ``capacity_gate_error``
+    distinguishes unhealthy controller failures from intentional limits."""
+    all_work_capacity_limited: bool = False
+    """True only when every otherwise-spawnable task considered this tick was
+    intentionally deferred by capacity. Dashboard health uses this to avoid
+    reporting a healthy backpressure condition as a stuck dispatcher."""
+    capacity_deferred: list[tuple[str, str]] = field(default_factory=list)
+    """Task ids deferred by the Bateman disk-capacity gate and its reason.
+
+    Deferral is deliberately not a task failure: no claim/run is created and
+    the spawn-failure circuit breaker is untouched."""
+    capacity_gate_error: bool = False
+    """True when the Bateman capacity controller failed validation or
+    execution. Work still fails closed, but this is unhealthy control-plane
+    failure rather than validated disk-pressure backpressure."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -10190,6 +10212,269 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+_BATEMAN_DISPATCH_CAPACITY_ENV = "BATEMAN_HERMES_DISPATCH_CAPACITY_GATE"
+_BATEMAN_DISPATCH_CAPACITY_TIMEOUT_SECONDS = 5.0
+_BATEMAN_FINAL_REVIEW_SHA256 = (
+    "e7d0cf71ff08e57d331411fc4e17bee9ee8fbeb5ba6c507fdfaea243db7bc0f2"
+)
+_BATEMAN_FINAL_REVIEW_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _bateman_capacity_helper_path() -> Path:
+    """Return the host-owned final-review helper for the current OS user.
+
+    This is an operator overlay, not a general Hermes setting.  The systemd
+    activation opts in with ``BATEMAN_HERMES_DISPATCH_CAPACITY_GATE=1`` and
+    the executable stays outside every profile/HERMES_HOME so a task cannot
+    replace it by editing its own profile state.
+    """
+    try:
+        import pwd
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        home = Path.home()
+    return home / ".local/libexec/bateman-hermes-dev/hermes-final-review"
+
+
+def _bateman_task_capacity_target(
+    task: Optional[Task], *, board: Optional[str] = None,
+) -> Path:
+    """Resolve an existing path on the filesystem a worker will use.
+
+    Existing absolute task workspaces win, including the nearest existing
+    ancestor when the final directory is not materialized yet. New managed
+    worktree tasks without a stored path use the board's ``default_workdir``
+    because that is where the resolver will create ``.worktrees/<task-id>``.
+    Scratch tasks fall back to the board workspaces root, then the already-open
+    board DB directory. Resolution itself never creates files.
+    """
+    candidates: list[Path] = []
+    if task is not None and task.workspace_kind == "worktree":
+        branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+        if not task.workspace_path:
+            board_slug = board if board else get_current_board()
+            board_default = (
+                read_board_metadata(board_slug).get("default_workdir") or ""
+            ).strip()
+            if board_default:
+                anchor = Path(board_default).expanduser()
+                if anchor.is_absolute():
+                    repo_root = _git_toplevel(anchor)
+                    candidates.append(
+                        (repo_root / ".worktrees" / task.id)
+                        if repo_root is not None
+                        else anchor
+                    )
+        else:
+            requested = Path(task.workspace_path).expanduser()
+            if requested.is_absolute():
+                requested_resolved = requested.resolve(strict=False)
+                predicted = requested
+                if requested.exists() and _is_linked_worktree_checkout(requested):
+                    actual_branch = _git_current_branch(requested)
+                    if actual_branch != branch_name:
+                        fallback_root = _repo_root_for_worktree_target(
+                            requested.parent
+                        )
+                        if fallback_root is not None:
+                            fallback = fallback_root / ".worktrees" / task.id
+                            if fallback.resolve(strict=False) != requested_resolved:
+                                predicted = fallback
+                else:
+                    repo_root = _git_toplevel(requested)
+                    if repo_root is not None and requested_resolved == repo_root:
+                        predicted = repo_root / ".worktrees" / task.id
+                    elif not requested.exists():
+                        fallback_root = _repo_root_for_worktree_target(
+                            requested.parent
+                        )
+                        if fallback_root is not None:
+                            predicted = requested
+                candidates.append(predicted)
+    elif task is not None and task.workspace_path:
+        workspace = Path(task.workspace_path).expanduser()
+        if workspace.is_absolute():
+            candidates.append(workspace)
+    try:
+        candidates.append(workspaces_root(board=board))
+    except Exception:
+        pass
+    candidates.append(kanban_db_path(board=board).parent)
+    for candidate in candidates:
+        probe = candidate
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        try:
+            return probe.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    raise RuntimeError("no existing filesystem path for capacity preflight")
+
+
+def _bateman_dispatch_capacity_preflight(
+    *, board: Optional[str] = None, target_path: Optional[Path] = None,
+) -> tuple[bool, str, bool]:
+    """Run the exact dashboard disk-capacity policy before a worker claim.
+
+    The gate is intentionally lazy and fail-closed only when the supervised
+    Bateman runtime explicitly enables it.  Housekeeping, health/status,
+    dry-runs, existing workers, and finalization do not pass through here.
+    A successful helper response must be valid JSON for the dashboard lane;
+    every missing/unsafe helper, timeout, signal, non-zero exit, or malformed
+    response defers the task without incrementing its failure counter. The
+    final bool distinguishes a validated policy block from a control
+    malfunction. Both fail closed, but only a genuine capacity block is
+    healthy backpressure for dispatcher telemetry.
+    """
+    if os.environ.get(_BATEMAN_DISPATCH_CAPACITY_ENV) != "1":
+        return True, "disabled", False
+
+    helper = _bateman_capacity_helper_path()
+    source_fd: Optional[int] = None
+    exec_fd: Optional[int] = None
+    try:
+        source_fd = os.open(
+            helper,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        helper_stat = os.fstat(source_fd)
+    except OSError as exc:
+        return False, f"capacity helper unavailable: {exc}", False
+    if not stat.S_ISREG(helper_stat.st_mode):
+        os.close(source_fd)
+        return False, "capacity helper is not a regular file", False
+    if helper_stat.st_uid != os.getuid():
+        os.close(source_fd)
+        return False, "capacity helper owner does not match dispatcher user", False
+    if helper_stat.st_mode & 0o022:
+        os.close(source_fd)
+        return False, "capacity helper is group/world writable", False
+    if not helper_stat.st_mode & 0o100:
+        os.close(source_fd)
+        return False, "capacity helper is not owner-executable", False
+    if not (0 < helper_stat.st_size <= _BATEMAN_FINAL_REVIEW_MAX_BYTES):
+        os.close(source_fd)
+        return False, "capacity helper has an invalid size", False
+
+    try:
+        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        remaining = helper_stat.st_size
+        while remaining:
+            chunk = os.read(source_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise OSError("capacity helper changed while being read")
+            chunks.append(chunk)
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(source_fd, 1):
+            raise OSError("capacity helper grew while being read")
+        if digest.hexdigest() != _BATEMAN_FINAL_REVIEW_SHA256:
+            raise OSError("capacity helper SHA-256 does not match the runtime pin")
+        if not hasattr(os, "memfd_create"):
+            raise OSError("sealed in-memory execution is unavailable")
+        import fcntl
+
+        exec_fd = os.memfd_create(
+            "bateman-hermes-final-review",
+            getattr(os, "MFD_CLOEXEC", 0) | getattr(os, "MFD_ALLOW_SEALING", 0),
+        )
+        for chunk in chunks:
+            view = memoryview(chunk)
+            while view:
+                written = os.write(exec_fd, view)
+                if written <= 0:
+                    raise OSError("could not stage verified capacity helper")
+                view = view[written:]
+        os.fchmod(exec_fd, 0o500)
+        # Python builds can omit the Linux sealing constants even when the
+        # running kernel supports memfd seals. These values are part of the
+        # stable Linux fcntl ABI; this path is already Linux-only because it
+        # executes through /proc/self/fd.
+        f_add_seals = getattr(fcntl, "F_ADD_SEALS", 1033)
+        f_seal_seal = getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+        f_seal_shrink = getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+        f_seal_grow = getattr(fcntl, "F_SEAL_GROW", 0x0004)
+        f_seal_write = getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+        fcntl.fcntl(
+            exec_fd,
+            f_add_seals,
+            f_seal_seal | f_seal_shrink | f_seal_grow | f_seal_write,
+        )
+    except (ImportError, OSError) as exc:
+        os.close(source_fd)
+        if exec_fd is not None:
+            os.close(exec_fd)
+        return False, f"capacity helper verification failed: {exc}", False
+    os.close(source_fd)
+    source_fd = None
+
+    try:
+        target = (
+            target_path
+            if target_path is not None
+            else kanban_db_path(board=board).parent
+        ).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        os.close(exec_fd)
+        return False, f"capacity target unavailable: {exc}", False
+
+    argv = [
+        f"/proc/self/fd/{exec_fd}",
+        "capacity",
+        "--lane", "dashboard",
+        "--path", str(target),
+        "--json",
+    ]
+    try:
+        completed = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_BATEMAN_DISPATCH_CAPACITY_TIMEOUT_SECONDS,
+            check=False,
+            pass_fds=(exec_fd,),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"capacity helper failed: {exc}", False
+    finally:
+        if exec_fd is not None:
+            os.close(exec_fd)
+    try:
+        payload = json.loads(completed.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return False, f"capacity helper returned invalid JSON: {exc}", False
+    if not isinstance(payload, dict):
+        return False, "capacity helper response is not an object", False
+    if payload.get("lane") != "dashboard":
+        return False, "capacity helper returned the wrong lane", False
+    status_value = payload.get("status")
+    if not isinstance(status_value, str):
+        return False, "capacity helper returned a non-string status", False
+    try:
+        reported_path = Path(str(payload["path"])).resolve(strict=True)
+    except (KeyError, OSError, RuntimeError, ValueError) as exc:
+        return False, f"capacity helper returned an invalid path: {exc}", False
+    if reported_path != target:
+        return False, "capacity helper reported a different filesystem path", False
+    if completed.returncode == 0 and status_value in {"ok", "warn"}:
+        return True, status_value, False
+    if completed.returncode == 75 and status_value == "block":
+        detail = (completed.stderr or "").strip()
+        return False, detail[:500] or "dashboard disk capacity policy block", True
+    return (
+        False,
+        f"capacity helper contract mismatch rc={completed.returncode} "
+        f"status={status_value!r}",
+        False,
+    )
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10373,6 +10658,8 @@ def _dispatch_once_locked(
     # budget so the total number of new workers stays bounded.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.capacity_limited = True
+            result.all_work_capacity_limited = True
             return result
         spawn_budget = max_spawn - running_count
 
@@ -10389,6 +10676,8 @@ def _dispatch_once_locked(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.capacity_limited = True
+            result.all_work_capacity_limited = True
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -10404,6 +10693,8 @@ def _dispatch_once_locked(
     pressure = _memory_pressure_level()
     if pressure == "critical":
         result.memory_pressure = pressure
+        result.capacity_limited = True
+        result.all_work_capacity_limited = True
         _log.warning(
             "kanban dispatch: system memory pressure is critical; "
             "spawning no new workers this tick (deferred, not dropped)"
@@ -10460,6 +10751,45 @@ def _dispatch_once_locked(
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
         ready_budget = max(spawn_budget - 1, 0)
     spawned = 0
+    saw_profile_capacity_limit = False
+    saw_profile_capacity_available = False
+    saw_disk_capacity_limit = False
+    saw_disk_capacity_available = False
+    saw_non_capacity_deferral = False
+
+    def _capacity_allows_task(task_id: str) -> bool:
+        """Evaluate disk capacity on the task's target FS just before claim."""
+        nonlocal saw_disk_capacity_limit, saw_disk_capacity_available
+        try:
+            task = get_task(conn, task_id)
+            if task is None:
+                raise RuntimeError(f"task {task_id} disappeared before capacity check")
+            target = _bateman_task_capacity_target(task, board=board)
+            allowed, reason, validated_policy_block = (
+                _bateman_dispatch_capacity_preflight(
+                    board=board,
+                    target_path=target,
+                )
+            )
+        except Exception as exc:
+            allowed = False
+            reason = f"capacity preflight control failure: {exc}"
+            validated_policy_block = False
+        if allowed:
+            saw_disk_capacity_available = True
+            return True
+        _log.warning(
+            "kanban dispatch: disk capacity deferred task %s: %s",
+            task_id,
+            reason,
+        )
+        result.capacity_limited = True
+        result.capacity_deferred.append((task_id, reason))
+        if validated_policy_block:
+            saw_disk_capacity_limit = True
+        else:
+            result.capacity_gate_error = True
+        return False
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -10500,6 +10830,7 @@ def _dispatch_once_locked(
         if ready_budget is not None and spawned >= ready_budget:
             break
         row_assignee = row["assignee"]
+        pending_default_assignment = False
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
             # unassigned ready task and an operator-configured fallback
@@ -10512,34 +10843,10 @@ def _dispatch_once_locked(
             # by ``kanban.default_assignee``, not "unassigned but secretly
             # routed".
             if _default_assignee and _default_assignee_resolved:
-                # Dry-run: show what WOULD happen (auto-assign + spawn) without
-                # mutating the DB. Real run: mutate the row + emit the
-                # 'assigned' event so the board state matches what just happened.
-                if not dry_run:
-                    try:
-                        with write_txn(conn):
-                            conn.execute(
-                                "UPDATE tasks SET assignee = ? WHERE id = ? "
-                                "AND (assignee IS NULL OR assignee = '')",
-                                (_default_assignee, row["id"]),
-                            )
-                            _append_event(
-                                conn, row["id"], "assigned",
-                                {
-                                    "assignee": _default_assignee,
-                                    "source": "kanban.default_assignee",
-                                },
-                            )
-                    except Exception:
-                        _log.debug(
-                            "kanban dispatch: failed to apply default_assignee=%r "
-                            "to task %s",
-                            _default_assignee, row["id"], exc_info=True,
-                        )
-                        result.skipped_unassigned.append(row["id"])
-                        continue
                 row_assignee = _default_assignee
-                result.auto_assigned_default.append(row["id"])
+                pending_default_assignment = True
+                if dry_run:
+                    result.auto_assigned_default.append(row["id"])
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
@@ -10578,7 +10885,10 @@ def _dispatch_once_locked(
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
+                result.capacity_limited = True
+                saw_profile_capacity_limit = True
                 continue
+            saw_profile_capacity_available = True
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -10589,6 +10899,7 @@ def _dispatch_once_locked(
         # blocks via the normal path rather than on first occurrence.
         guard_reason = check_respawn_guard(conn, row["id"])
         if guard_reason is not None:
+            saw_non_capacity_deferral = True
             result.respawn_guarded.append((row["id"], guard_reason))
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
@@ -10612,8 +10923,40 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        if not _capacity_allows_task(row["id"]):
+            continue
+        if pending_default_assignment:
+            # Capacity refusal must be side-effect free. Persist the fallback
+            # owner only after the per-task disk check allows this spawn.
+            try:
+                with write_txn(conn):
+                    updated = conn.execute(
+                        "UPDATE tasks SET assignee = ? WHERE id = ? "
+                        "AND (assignee IS NULL OR assignee = '')",
+                        (_default_assignee, row["id"]),
+                    )
+                    if updated.rowcount != 1:
+                        raise RuntimeError("task assignee changed before dispatch")
+                    _append_event(
+                        conn, row["id"], "assigned",
+                        {
+                            "assignee": _default_assignee,
+                            "source": "kanban.default_assignee",
+                        },
+                    )
+            except Exception:
+                _log.debug(
+                    "kanban dispatch: failed to apply default_assignee=%r "
+                    "to task %s",
+                    _default_assignee, row["id"], exc_info=True,
+                )
+                saw_non_capacity_deferral = True
+                result.skipped_unassigned.append(row["id"])
+                continue
+            result.auto_assigned_default.append(row["id"])
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            saw_non_capacity_deferral = True
             continue
         try:
             resolved_branch_name = None
@@ -10720,9 +11063,13 @@ def _dispatch_once_locked(
                 result.skipped_per_profile_capped.append(
                     (row["id"], row["assignee"], current)
                 )
+                result.capacity_limited = True
+                saw_profile_capacity_limit = True
                 continue
+            saw_profile_capacity_available = True
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
         if guard_reason is not None:
+            saw_non_capacity_deferral = True
             result.respawn_guarded.append((row["id"], guard_reason))
             if not dry_run:
                 with write_txn(conn):
@@ -10739,8 +11086,11 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
+        if not _capacity_allows_task(row["id"]):
+            continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            saw_non_capacity_deferral = True
             continue
         try:
             resolved_branch_name = None
@@ -10800,6 +11150,16 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+    if result.capacity_gate_error:
+        # Missing/malformed/tampered policy infrastructure is not healthy
+        # backpressure. Keep the dispatcher fail-closed, but let health
+        # reporting surface that the controller itself needs attention.
+        result.all_work_capacity_limited = False
+    elif saw_profile_capacity_limit or saw_disk_capacity_limit:
+        result.all_work_capacity_limited = not (
+            saw_profile_capacity_available or saw_disk_capacity_available
+            or saw_non_capacity_deferral
+        )
     return result
 
 
