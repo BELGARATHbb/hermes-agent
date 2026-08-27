@@ -126,3 +126,32 @@ def test_no_subscriber_short_circuits_tick_hook(kanban_home, monkeypatch):
     finally:
         conn.close()
     assert "on_kanban_dispatch_tick" not in invoked
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        pytest.param(
+            kb.DispatchResult(
+                capacity_limited=True,
+                capacity_deferred=[("task-1", "low disk")],
+            ),
+            "capacity_deferred",
+            id="validated-capacity-backpressure",
+        ),
+        pytest.param(
+            kb.DispatchResult(
+                capacity_limited=True,
+                capacity_gate_error=True,
+                capacity_deferred=[("task-1", "helper missing")],
+            ),
+            "capacity_error",
+            id="capacity-controller-failure",
+        ),
+    ],
+)
+def test_capacity_tick_outcome_is_not_reported_idle(
+    captured_ticks, result, expected,
+):
+    kb._fire_dispatch_tick_hook(result)
+    assert captured_ticks[-1]["outcome"] == expected

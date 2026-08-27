@@ -1628,10 +1628,8 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+        def _spawnable_board_slugs() -> set[str]:
+            """Return boards with ready/review work the dispatcher can spawn.
 
             Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
             ``orion-research``) are pulled by terminals via
@@ -1651,15 +1649,16 @@ class GatewayKanbanWatchersMixin:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            spawnable: set[str] = set()
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
                     if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
-                        return True
+                        spawnable.add(slug)
+                    elif _review_probe and _kb.has_spawnable_review(conn):
+                        spawnable.add(slug)
                 except Exception:
                     continue
                 finally:
@@ -1668,7 +1667,7 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                         except Exception:
                             pass
-            return False
+            return spawnable
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
@@ -1799,6 +1798,7 @@ class GatewayKanbanWatchersMixin:
                         await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(_tick_once)
                     any_spawned = False
+                    results_by_slug = dict(results or [])
                     for slug, res in (results or []):
                         if res is not None and getattr(res, "spawned", None):
                             any_spawned = True
@@ -1816,8 +1816,51 @@ class GatewayKanbanWatchersMixin:
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
                     # Health telemetry (aggregate across boards)
-                    ready_pending = await _to_thread_process_service(_ready_nonempty)
-                    if ready_pending and not any_spawned:
+                    spawnable_boards = await _to_thread_process_service(
+                        _spawnable_board_slugs
+                    )
+                    # A fail-closed controller error can leave an unassigned
+                    # task untouched (including its assignee), so the normal
+                    # post-tick spawnability probe may no longer see that
+                    # board. The result proves work reached the spawn gate;
+                    # retain it in health accounting so a broken controller
+                    # cannot silence the stuck warning.
+                    spawnable_boards.update(
+                        slug for slug, res in results_by_slug.items()
+                        if getattr(res, "capacity_gate_error", False)
+                    )
+                    ready_pending = bool(spawnable_boards)
+                    all_pending_capacity_limited = ready_pending and all(
+                        (
+                            getattr(
+                                results_by_slug.get(slug),
+                                "all_work_capacity_limited",
+                                None,
+                            )
+                            if hasattr(
+                                results_by_slug.get(slug),
+                                "all_work_capacity_limited",
+                            )
+                            else (
+                                getattr(
+                                    results_by_slug.get(slug),
+                                    "capacity_limited",
+                                    False,
+                                )
+                                and not getattr(
+                                    results_by_slug.get(slug),
+                                    "skipped_per_profile_capped",
+                                    None,
+                                )
+                            )
+                        )
+                        for slug in spawnable_boards
+                    )
+                    if (
+                        ready_pending
+                        and not any_spawned
+                        and not all_pending_capacity_limited
+                    ):
                         bad_ticks += 1
                     else:
                         bad_ticks = 0
