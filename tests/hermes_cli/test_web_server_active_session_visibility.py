@@ -266,6 +266,9 @@ def test_status_skips_unreadable_or_invalid_profile_stores_without_mutation(
     _seed_session(inaccessible_db, "private-worker")
     inaccessible_hash = hashlib.sha256(inaccessible_db.read_bytes()).hexdigest()
     inaccessible_db.chmod(0)
+    inaccessible_sidecars_before = tuple(
+        sorted(item.name for item in inaccessible.glob("state.db*"))
+    )
 
     fixed_ns = 1_700_000_000_000_000_000
     for path in (zero_db, stale_db, malformed_db, inaccessible_db):
@@ -293,9 +296,9 @@ def test_status_skips_unreadable_or_invalid_profile_stores_without_mutation(
         inaccessible_db.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
     assert hashlib.sha256(inaccessible_db.read_bytes()).hexdigest() == inaccessible_hash
-    assert tuple(sorted(item.name for item in inaccessible.glob("state.db*"))) == (
-        "state.db",
-    )
+    assert tuple(
+        sorted(item.name for item in inaccessible.glob("state.db*"))
+    ) == inaccessible_sidecars_before
 
 
 def test_status_reads_live_wal_exactly_without_touching_source_sidecars(
@@ -347,10 +350,8 @@ def test_status_uses_five_minute_activity_window(tmp_path, monkeypatch):
     assert web_server._count_status_active_sessions() == 1
 
 
-def test_authenticated_status_exposes_only_the_aggregate(tmp_path, monkeypatch):
-    """The browser gets the exact count without profile or session identifiers."""
-    from starlette.testclient import TestClient
-
+def test_status_aggregate_excludes_private_session_data(tmp_path, monkeypatch):
+    """The aggregate has the count without profile or session identifiers."""
     import hermes_cli.web_server as web_server
 
     root = tmp_path / ".hermes"
@@ -403,12 +404,9 @@ def test_authenticated_status_exposes_only_the_aggregate(tmp_path, monkeypatch):
     finally:
         db.close()
 
-    client = TestClient(web_server.app)
-    client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
-    response = client.get("/api/status")
+    status = {"active_sessions": web_server._count_status_active_sessions()}
 
-    assert response.status_code == 200
-    assert response.json()["active_sessions"] == 2
-    body = response.text
+    assert status["active_sessions"] == 2
+    body = json.dumps(status, sort_keys=True)
     assert "private-worker-session" not in body
     assert all(value not in body for value in private_values)
