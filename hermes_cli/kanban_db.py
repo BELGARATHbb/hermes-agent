@@ -10382,29 +10382,42 @@ def _dispatch_once_locked(
         ready_budget = max(spawn_budget - 1, 0)
     spawned = 0
     saw_profile_capacity_limit = False
-    saw_profile_capacity_available = False
     saw_disk_capacity_limit = False
     saw_disk_capacity_available = False
     saw_non_capacity_deferral = False
+    capacity_controller_failure: Optional[str] = None
 
     def _capacity_allows_task(task_id: str) -> bool:
         """Evaluate disk capacity on the task's target FS just before claim."""
         nonlocal saw_disk_capacity_limit, saw_disk_capacity_available
+        nonlocal capacity_controller_failure
         try:
             task = get_task(conn, task_id)
             if task is None:
                 raise RuntimeError(f"task {task_id} disappeared before capacity check")
             target = _bateman_task_capacity_target(task, board=board)
-            allowed, reason, validated_policy_block = (
-                _bateman_dispatch_capacity_preflight(
-                    board=board,
-                    target_path=target,
-                )
-            )
         except Exception as exc:
             allowed = False
-            reason = f"capacity preflight control failure: {exc}"
+            reason = f"capacity preflight target failure: {exc}"
             validated_policy_block = False
+        else:
+            if capacity_controller_failure is not None:
+                allowed = False
+                reason = capacity_controller_failure
+                validated_policy_block = False
+            else:
+                allowed, reason, validated_policy_block = (
+                    _bateman_dispatch_capacity_preflight(
+                        board=board,
+                        target_path=target,
+                    )
+                )
+                if not allowed and not validated_policy_block:
+                    # Missing/tampered/timed-out policy infrastructure is a
+                    # tick-global control failure. Retry next tick, but do not
+                    # hold the single-writer dispatch lock for N * timeout
+                    # across every queued task in this tick.
+                    capacity_controller_failure = reason
         if allowed:
             saw_disk_capacity_available = True
             return True
@@ -10518,7 +10531,6 @@ def _dispatch_once_locked(
                 result.capacity_limited = True
                 saw_profile_capacity_limit = True
                 continue
-            saw_profile_capacity_available = True
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -10696,7 +10708,6 @@ def _dispatch_once_locked(
                 result.capacity_limited = True
                 saw_profile_capacity_limit = True
                 continue
-            saw_profile_capacity_available = True
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
         if guard_reason is not None:
             saw_non_capacity_deferral = True
@@ -10787,8 +10798,7 @@ def _dispatch_once_locked(
         result.all_work_capacity_limited = False
     elif saw_profile_capacity_limit or saw_disk_capacity_limit:
         result.all_work_capacity_limited = not (
-            saw_profile_capacity_available or saw_disk_capacity_available
-            or saw_non_capacity_deferral
+            saw_disk_capacity_available or saw_non_capacity_deferral
         )
     return result
 

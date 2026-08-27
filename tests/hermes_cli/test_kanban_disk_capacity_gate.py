@@ -76,6 +76,7 @@ def test_ready_and_review_each_check_capacity_immediately_before_spawn(
         conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review,))
         result = kb.dispatch_once(
             conn,
+            max_in_progress_per_profile=5,
             spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 42,
         )
 
@@ -202,6 +203,7 @@ def test_block_defers_ready_without_claim_run_or_failure(
         second = kb.create_task(conn, title="two", assignee="worker")
         result = kb.dispatch_once(
             conn,
+            max_in_progress_per_profile=5,
             spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 42,
         )
         for task_id in (first, second):
@@ -366,6 +368,29 @@ def test_helper_hash_mismatch_fails_before_execution(
         task_id = kb.create_task(conn, title="hash mismatch", assignee="worker")
         result = kb.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: 42)
         assert _row(conn, task_id)["status"] == "ready"
+    assert result.capacity_gate_error is True
+    assert result.all_work_capacity_limited is False
+
+
+def test_controller_timeout_is_attempted_only_once_per_tick(
+    capacity_home, all_assignees_spawnable, monkeypatch,
+):
+    calls = 0
+
+    def timeout(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise subprocess.TimeoutExpired(args[0], kwargs.get("timeout", 5))
+
+    monkeypatch.setattr(kb.subprocess, "run", timeout)
+    with kb.connect() as conn:
+        task_ids = [
+            kb.create_task(conn, title=f"queued-{index}", assignee="worker")
+            for index in range(3)
+        ]
+        result = kb.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: 42)
+    assert calls == 1
+    assert [item[0] for item in result.capacity_deferred] == task_ids
     assert result.capacity_gate_error is True
     assert result.all_work_capacity_limited is False
 
