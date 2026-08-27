@@ -698,13 +698,16 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed"}:
-            # A success (or manual reclaim) breaks the streak.
+        elif outcome in {"completed", "reclaimed", "blocked"}:
+            # A successful lifecycle handoff (or manual reclaim) breaks the
+            # streak.  In particular, ``blocked`` is a protocol-compliant
+            # terminal result: once a later worker has explained why it must
+            # stop and called kanban_block, historical crashes are no longer
+            # consecutive current distress.
             break
         else:
-            # Other outcomes (timed_out, blocked, spawn_failed, gave_up)
-            # aren't crash signals — don't count them, but they also
-            # don't break the crash streak.
+            # Other outcomes aren't crash signals. Keep scanning so the
+            # existing mixed-failure behavior remains unchanged.
             continue
     if consecutive < threshold:
         return []
