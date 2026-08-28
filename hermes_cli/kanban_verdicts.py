@@ -188,8 +188,8 @@ def normalize_state_events(events: Optional[Iterable[dict[str, Any]]]) -> list[d
             raise VerdictValidationError("state is not recognized")
         value = item["value"]
         if not (
-            isinstance(value, bool)
-            or (isinstance(value, str) and value in {"unknown", "not_applicable"})
+            type(value) is bool
+            or (type(value) is str and value in {"unknown", "not_applicable"})
         ):
             raise VerdictValidationError("state value is not recognized")
         item["occurred_at"] = _timestamp(item["occurred_at"], "occurred_at")

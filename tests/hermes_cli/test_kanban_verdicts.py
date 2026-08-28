@@ -200,6 +200,23 @@ def test_invalid_json_state_values_do_not_alias_valid_dispositions(value):
         normalize_state_events([event])
 
 
+def test_state_value_subclasses_are_rejected_before_persistence():
+    class StringSubclass(str):
+        pass
+
+    event = {
+        "state": "deployed",
+        "value": StringSubclass("not_applicable"),
+        "occurred_at": 1_787_500_002,
+        "receipt_id": "receipt-subclass",
+        "issued_by_run": 41,
+        "manifest_id": "manifest-subclass",
+    }
+
+    with pytest.raises(VerdictValidationError, match="state value is not recognized"):
+        normalize_state_events([event])
+
+
 def test_normalization_is_private_shape_and_does_not_mutate_input():
     raw = [_verdict("v1", "product", "pass")]
     before = copy.deepcopy(raw)
