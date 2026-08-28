@@ -186,7 +186,11 @@ def normalize_state_events(events: Optional[Iterable[dict[str, Any]]]) -> list[d
         item = copy.deepcopy(raw)
         if item["state"] not in STATE_NAMES:
             raise VerdictValidationError("state is not recognized")
-        if not any(item["value"] is allowed for allowed in STATE_VALUES):
+        value = item["value"]
+        if not (
+            isinstance(value, bool)
+            or (isinstance(value, str) and value in {"unknown", "not_applicable"})
+        ):
             raise VerdictValidationError("state value is not recognized")
         item["occurred_at"] = _timestamp(item["occurred_at"], "occurred_at")
         item["receipt_id"] = _evidence_identifier(item["receipt_id"], "receipt_id")

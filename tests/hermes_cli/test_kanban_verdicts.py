@@ -166,6 +166,35 @@ def test_unknown_and_not_applicable_states_remain_distinct():
     assert [event["value"] for event in events] == ["unknown", "not_applicable"]
 
 
+def test_json_decoded_not_applicable_state_is_accepted_by_value():
+    value = json.loads('{"value":"not_applicable"}')["value"]
+
+    events = normalize_state_events([{
+        "state": "deployed",
+        "value": value,
+        "occurred_at": 1_787_500_002,
+        "receipt_id": "receipt-json",
+        "issued_by_run": 41,
+        "manifest_id": "manifest-json",
+    }])
+
+    assert events[0]["value"] == "not_applicable"
+
+
+def test_integer_state_values_do_not_alias_booleans():
+    event = {
+        "state": "deployed",
+        "value": 1,
+        "occurred_at": 1_787_500_002,
+        "receipt_id": "receipt-int",
+        "issued_by_run": 41,
+        "manifest_id": "manifest-int",
+    }
+
+    with pytest.raises(VerdictValidationError, match="state value is not recognized"):
+        normalize_state_events([event])
+
+
 def test_normalization_is_private_shape_and_does_not_mutate_input():
     raw = [_verdict("v1", "product", "pass")]
     before = copy.deepcopy(raw)
