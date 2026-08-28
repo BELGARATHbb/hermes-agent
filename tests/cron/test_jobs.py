@@ -420,6 +420,51 @@ class TestResolveJobRef:
 
 
 class TestMarkJobRun:
+    def test_interval_completion_preserves_claim_time_anchor(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A one-minute job must remain due on the next one-minute tick.
+
+        The scheduler advances ``next_run_at`` before dispatch. Completion
+        used to overwrite that anchor with ``completion + interval``; a job
+        starting on a 10:50:10 tick and finishing at 10:50:11 therefore moved
+        to 10:51:11 and missed the 10:51:10 tick, halving its real cadence.
+        """
+        tick_time = datetime(2026, 8, 28, 16, 50, 10, tzinfo=timezone.utc)
+        completion_time = tick_time + timedelta(seconds=1)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: tick_time)
+        job = create_job(prompt="Controller", schedule="every 1m")
+
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (tick_time + timedelta(minutes=1)).isoformat()
+        save_jobs(jobs)
+
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: completion_time)
+        mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert updated["last_run_at"] == completion_time.isoformat()
+        assert updated["next_run_at"] == (
+            tick_time + timedelta(minutes=1)
+        ).isoformat()
+
+    def test_interval_completion_repairs_malformed_anchor(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A corrupt persisted anchor falls back to completion-time repair."""
+        completion_time = datetime(2026, 8, 28, 16, 50, 11, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: completion_time)
+        job = create_job(prompt="Controller", schedule="every 1m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "not-a-timestamp"
+        save_jobs(jobs)
+
+        mark_job_run(job["id"], success=True)
+
+        assert get_job(job["id"])["next_run_at"] == (
+            completion_time + timedelta(minutes=1)
+        ).isoformat()
+
     def test_increments_completed(self, tmp_cron_dir):
         job = create_job(prompt="Test", schedule="every 1h")
         mark_job_run(job["id"], success=True)

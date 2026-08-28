@@ -2860,8 +2860,30 @@ def _mark_job_run_locked(
                         save_jobs(jobs)
                         return True
                 
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                # Keep an interval job's claim-time schedule anchor. The
+                # dispatcher pre-advances recurring jobs before execution for
+                # crash safety; re-anchoring an interval from completion here
+                # adds the runtime to every cadence. When the ticker interval
+                # equals the job interval, even a one-second run then misses
+                # the next tick and fires only every other cycle. A long run
+                # may leave this anchor in the past, which is intentional: the
+                # next tick runs it once and claim_job_for_fire fast-forwards
+                # from that current tick, so there is no catch-up burst.
+                #
+                # Direct mark_job_run callers that did not pre-advance retain
+                # the job's existing interval anchor as well (a manual run
+                # should not drift the standing schedule). Malformed/missing
+                # anchors fall back to the legacy completion-time calculation.
+                kind = job.get("schedule", {}).get("kind")
+                preserved_interval_anchor = False
+                if kind == "interval" and job.get("next_run_at"):
+                    try:
+                        _ensure_aware(datetime.fromisoformat(job["next_run_at"]))
+                        preserved_interval_anchor = True
+                    except (TypeError, ValueError):
+                        pass
+                if not preserved_interval_anchor:
+                    job["next_run_at"] = compute_next_run(job["schedule"], now)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -2870,7 +2892,6 @@ def _mark_job_run_locked(
                 # missing runtime dep into "job completed" and the user's
                 # schedule quietly goes off. See issue #16265.
                 if job["next_run_at"] is None:
-                    kind = job.get("schedule", {}).get("kind")
                     if kind in {"cron", "interval"}:
                         job["state"] = "error"
                         if not job.get("last_error"):
