@@ -667,6 +667,8 @@ def _handle_complete(args: dict, **kw) -> str:
         return ownership_err
     summary = args.get("summary")
     metadata = args.get("metadata")
+    verdicts = args.get("verdicts")
+    state_events = args.get("state_events")
     result = args.get("result")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
@@ -679,6 +681,18 @@ def _handle_complete(args: dict, **kw) -> str:
             metadata = json.loads(meta_json)
         except json.JSONDecodeError:
             pass
+    for field_name, payload in (("verdicts", verdicts), ("state_events", state_events)):
+        if payload is not None and not isinstance(payload, list):
+            return tool_error(f"{field_name} must be an array")
+        if payload is not None:
+            safe_json = redact_sensitive_text(json.dumps(payload), force=True)
+            try:
+                if field_name == "verdicts":
+                    verdicts = json.loads(safe_json)
+                else:
+                    state_events = json.loads(safe_json)
+            except json.JSONDecodeError:
+                return tool_error(f"{field_name} could not be safely serialized")
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
@@ -769,6 +783,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
+                    verdicts=verdicts, state_events=state_events,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                 )
@@ -812,6 +827,65 @@ def _handle_complete(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_complete failed")
         return tool_error(f"kanban_complete: {e}")
+
+
+def _handle_append_state(args: dict, **kw) -> str:
+    """Append typed state evidence from this claimed run to an ancestor task."""
+    delegated_err = _reject_delegated_child_mutation("kanban_append_state")
+    if delegated_err:
+        return delegated_err
+    subject_task_id = args.get("task_id")
+    if not isinstance(subject_task_id, str) or not subject_task_id.strip():
+        return tool_error("task_id is required")
+    issuer_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not issuer_task_id or not _is_dispatcher_owned_worker():
+        return tool_error(
+            "kanban_append_state requires an authenticated dispatcher-owned worker run"
+        )
+    requested_board = args.get("board")
+    pinned_board = os.environ.get("HERMES_KANBAN_BOARD")
+    if requested_board and pinned_board and requested_board != pinned_board:
+        return tool_error(
+            f"kanban_append_state pinned board is {pinned_board}; refusing board override"
+        )
+    issuer_run_id = _worker_run_id(issuer_task_id)
+    if issuer_run_id is None:
+        return tool_error("kanban_append_state requires HERMES_KANBAN_RUN_ID")
+    state_events = args.get("state_events")
+    if not isinstance(state_events, list) or not state_events:
+        return tool_error("state_events must be a non-empty array")
+    try:
+        safe_json = redact_sensitive_text(json.dumps(state_events), force=True)
+        state_events = json.loads(safe_json)
+    except (TypeError, json.JSONDecodeError):
+        return tool_error("state_events could not be safely serialized")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            issuer_run = kb.get_run(conn, issuer_run_id)
+            if issuer_run is None:
+                return tool_error(f"issuer run {issuer_run_id} does not exist")
+            inserted = kb.append_task_state_events(
+                conn,
+                subject_task_id.strip(),
+                state_events,
+                issuer_run_id=issuer_run_id,
+                issuer_task_id=issuer_task_id,
+                issuer_profile=issuer_run.profile,
+            )
+            return _ok(
+                task_id=subject_task_id.strip(),
+                issuer_task_id=issuer_task_id,
+                issuer_run_id=issuer_run_id,
+                inserted=inserted,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_append_state: {e}")
+    except Exception as e:
+        logger.exception("kanban_append_state failed")
+        return tool_error(f"kanban_append_state: {e}")
 
 
 def _handle_block(args: dict, **kw) -> str:
@@ -1804,6 +1878,28 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workers alongside ``summary``."
                 ),
             },
+            "verdicts": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": (
+                    "Typed per-subject verdict records validated against the "
+                    "Kanban verdict ledger JSON Schema. Prose PASS/FAIL markers "
+                    "never substitute for this ledger. On a typed_v1 board, "
+                    "completion requires an effective product/design/release "
+                    "pass or not_applicable verdict."
+                ),
+            },
+            "state_events": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": (
+                    "Independent timestamped evidence events for local, tested, "
+                    "committed, pushed, reviewed, merged, released, deployed, "
+                    "use_verified, and runtime_healthy. On a typed_v1 board, "
+                    "provide exactly one final true/not_applicable disposition "
+                    "for every rung and bind its manifest_id to a verdict manifest."
+                ),
+            },
             "result": {
                 "type": "string",
                 "description": (
@@ -1855,6 +1951,64 @@ KANBAN_COMPLETE_SCHEMA = {
         "required": [],
     },
 }
+
+KANBAN_APPEND_STATE_SCHEMA = {
+    "name": "kanban_append_state",
+    "description": (
+        "Append independently validated release/runtime state evidence to a "
+        "completed ancestor task from your current claimed evidence run. "
+        "This never reopens or rewrites the completed task or its runs."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Completed subject task that is an ancestor of the current task.",
+            },
+            "state_events": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "state": {
+                            "type": "string",
+                            "enum": [
+                                "local", "tested", "committed", "pushed", "reviewed",
+                                "merged", "released", "deployed", "use_verified",
+                                "runtime_healthy",
+                            ],
+                        },
+                        "value": {
+                            "oneOf": [
+                                {"type": "boolean"},
+                                {"type": "string", "enum": ["unknown", "not_applicable"]},
+                            ],
+                        },
+                        "occurred_at": {"type": "integer", "minimum": 0},
+                        "receipt_id": {"type": "string", "minLength": 1, "maxLength": 512},
+                        "issued_by_run": {"type": "integer", "minimum": 1},
+                        "manifest_id": {"type": "string", "minLength": 1, "maxLength": 512},
+                    },
+                    "required": [
+                        "state", "value", "occurred_at", "receipt_id",
+                        "issued_by_run", "manifest_id",
+                    ],
+                },
+                "description": (
+                    "Chronological typed events with state, value, occurred_at, "
+                    "receipt_id, manifest_id, and issued_by_run bound to this run."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "state_events"],
+    },
+}
+
 
 KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
@@ -2378,6 +2532,15 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
+)
+
+registry.register(
+    name="kanban_append_state",
+    toolset="kanban",
+    schema=KANBAN_APPEND_STATE_SCHEMA,
+    handler=_handle_append_state,
+    check_fn=_check_kanban_mode,
+    emoji="🧾",
 )
 
 registry.register(

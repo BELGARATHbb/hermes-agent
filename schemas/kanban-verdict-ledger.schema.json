@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-agent.dev/schemas/kanban-verdict-ledger.schema.json",
+  "title": "Hermes Kanban typed verdict and release-state ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdicts", "state_events"],
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/verdict"}
+    },
+    "state_events": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/stateEvent"}
+    }
+  },
+  "$defs": {
+    "idList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 512}
+    },
+    "verdictValue": {
+      "enum": ["pass", "fail", "blocked", "unverified", "not_applicable"]
+    },
+    "verdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "verdict_subject", "subject_id", "subject_version", "subject_hash",
+        "criterion", "scope_rung", "verdict_kind", "verdict", "defect_class",
+        "owner", "issued_by_run", "evidence_manifest_id", "effective",
+        "effective_at", "supersedes", "contradicts", "corrected_by", "verified_by"
+      ],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 512},
+        "verdict_subject": {
+          "enum": ["product", "model_class", "design", "process", "authority", "evidence", "release"]
+        },
+        "subject_id": {"type": "string", "minLength": 1, "maxLength": 512},
+        "subject_version": {"type": "string", "minLength": 1, "maxLength": 512},
+        "subject_hash": {"type": "string", "minLength": 1, "maxLength": 512},
+        "criterion": {"type": "string", "minLength": 1, "maxLength": 512},
+        "scope_rung": {"type": "string", "minLength": 1, "maxLength": 512},
+        "verdict_kind": {"type": "string", "minLength": 1, "maxLength": 512},
+        "verdict": {"$ref": "#/$defs/verdictValue"},
+        "defect_class": {
+          "type": ["string", "null"], "minLength": 1, "maxLength": 512
+        },
+        "owner": {"type": "string", "minLength": 1, "maxLength": 512},
+        "process_verdict": {
+          "anyOf": [{"$ref": "#/$defs/verdictValue"}, {"type": "null"}]
+        },
+        "authority_verdict": {
+          "anyOf": [{"$ref": "#/$defs/verdictValue"}, {"type": "null"}]
+        },
+        "issued_by_run": {"type": "integer", "minimum": 1},
+        "evidence_manifest_id": {"type": "string", "minLength": 1, "maxLength": 512},
+        "effective": {"type": "boolean"},
+        "effective_at": {"type": "integer", "minimum": 0},
+        "supersedes": {"$ref": "#/$defs/idList"},
+        "contradicts": {"$ref": "#/$defs/idList"},
+        "corrected_by": {"$ref": "#/$defs/idList"},
+        "verified_by": {"$ref": "#/$defs/idList"}
+      }
+    },
+    "stateEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "value", "occurred_at", "receipt_id", "issued_by_run", "manifest_id"],
+      "properties": {
+        "state": {
+          "enum": ["local", "tested", "committed", "pushed", "reviewed", "merged", "released", "deployed", "use_verified", "runtime_healthy"]
+        },
+        "value": {
+          "oneOf": [
+            {"type": "boolean"},
+            {"enum": ["unknown", "not_applicable"]}
+          ]
+        },
+        "occurred_at": {"type": "integer", "minimum": 0},
+        "receipt_id": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$"},
+        "issued_by_run": {"type": "integer", "minimum": 1},
+        "manifest_id": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$"}
+      }
+    }
+  }
+}

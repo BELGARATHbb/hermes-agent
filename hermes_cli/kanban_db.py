@@ -852,6 +852,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "project_id": None,
         "created_at": None,
         "archived": False,
+        "completion_policy": "legacy",
     }
     try:
         p = board_metadata_path(slug)
@@ -878,6 +879,7 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    completion_policy: Optional[str] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -908,6 +910,11 @@ def write_board_metadata(
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if project_id is not None:
         meta["project_id"] = str(project_id) if project_id else None
+    if completion_policy is not None:
+        policy = str(completion_policy).strip().lower()
+        if policy not in {"legacy", "typed_v1"}:
+            raise ValueError("completion_policy must be 'legacy' or 'typed_v1'")
+        meta["completion_policy"] = policy
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -1264,6 +1271,7 @@ class Run:
     outcome: Optional[str]
     summary: Optional[str]
     metadata: Optional[dict]
+    verdicts: list[dict]
     error: Optional[str]
 
     @classmethod
@@ -1272,6 +1280,12 @@ class Run:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
         except Exception:
             meta = None
+        try:
+            verdicts = json.loads(row["verdicts"]) if "verdicts" in row.keys() and row["verdicts"] else []
+            if not isinstance(verdicts, list):
+                verdicts = []
+        except Exception:
+            verdicts = []
         return cls(
             id=int(row["id"]),
             task_id=row["task_id"],
@@ -1288,6 +1302,7 @@ class Run:
             outcome=row["outcome"],
             summary=row["summary"],
             metadata=meta,
+            verdicts=verdicts,
             error=row["error"],
         )
 
@@ -1474,7 +1489,20 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
+    verdicts            TEXT,
     error               TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_run_state_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id       TEXT NOT NULL,
+    run_id        INTEGER NOT NULL,
+    state         TEXT NOT NULL,
+    value         TEXT NOT NULL,
+    occurred_at   INTEGER NOT NULL,
+    receipt_id    TEXT,
+    issued_by_run INTEGER NOT NULL,
+    manifest_id   TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1522,6 +1550,8 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_state_events_task      ON task_run_state_events(task_id, occurred_at, id);
+CREATE INDEX IF NOT EXISTS idx_state_events_run       ON task_run_state_events(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -2719,6 +2749,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    # Historical rows remain NULL: read paths can distinguish typed evidence
+    # from legacy prose without rewriting or reinterpreting old attempts.
+    runs_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_runs'"
+    ).fetchone() is not None
+    if runs_table_exists:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "verdicts" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "verdicts", "verdicts TEXT")
+
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -2886,7 +2926,7 @@ _REBUILD_SPECS = {
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
-        " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
+        " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT, verdicts TEXT,"
         " error TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
@@ -4340,6 +4380,7 @@ def _end_run(
     summary: Optional[str] = None,
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
+    verdicts: Optional[list[dict]] = None,
     status: Optional[str] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
@@ -4358,6 +4399,19 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    from hermes_cli.kanban_verdicts import default_terminal_verdict, normalize_verdicts
+    normalized_verdicts = normalize_verdicts(verdicts)
+    if not normalized_verdicts:
+        run_row = conn.execute(
+            "SELECT profile FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+        normalized_verdicts = [default_terminal_verdict(
+            task_id=task_id,
+            run_id=run_id,
+            profile=run_row["profile"] if run_row else None,
+            outcome=outcome,
+            occurred_at=now,
+        )]
     conn.execute(
         """
         UPDATE task_runs
@@ -4366,6 +4420,7 @@ def _end_run(
                summary       = ?,
                error         = ?,
                metadata      = ?,
+               verdicts      = ?,
                ended_at      = ?,
                claim_lock    = NULL,
                claim_expires = NULL,
@@ -4379,6 +4434,7 @@ def _end_run(
             summary,
             error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(normalized_verdicts, ensure_ascii=False),
             now,
             run_id,
         ),
@@ -4404,6 +4460,7 @@ def _synthesize_ended_run(
     summary: Optional[str] = None,
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
+    verdicts: Optional[list[dict]] = None,
 ) -> int:
     """Insert a zero-duration, already-closed run row.
 
@@ -4432,19 +4489,34 @@ def _synthesize_ended_run(
         INSERT INTO task_runs (
             task_id, profile, step_key,
             status, outcome,
-            summary, error, metadata,
+            summary, error, metadata, verdicts,
             started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, profile, step_key,
             outcome, outcome,
             summary, error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(verdicts, ensure_ascii=False) if verdicts else None,
             now, now,
         ),
     )
-    return int(cur.lastrowid or 0)
+    run_id = int(cur.lastrowid or 0)
+    if not verdicts:
+        from hermes_cli.kanban_verdicts import default_terminal_verdict
+        generated = default_terminal_verdict(
+            task_id=task_id,
+            run_id=run_id,
+            profile=profile,
+            outcome=outcome,
+            occurred_at=now,
+        )
+        conn.execute(
+            "UPDATE task_runs SET verdicts = ? WHERE id = ?",
+            (json.dumps([generated], ensure_ascii=False), run_id),
+        )
+    return run_id
 
 
 # ---------------------------------------------------------------------------
@@ -5360,6 +5432,212 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _authorize_state_event_issuer(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    issuer_run_id: int,
+    issuer_task_id: str,
+    issuer_profile: str,
+    allow_retained_completion_authority: bool = False,
+) -> None:
+    """Fail closed unless a real run is authorized to evidence ``task_id``.
+
+    Public append callers must use an active claimed run from a descendant
+    evidence task. The subject's latest completed run is accepted only when
+    the private compatibility path explicitly opts in, preserving the original
+    ``complete_task`` RED without granting dashboard/tool callers historical
+    authority. Unrelated, superseded, or already-ended evidence runs fail closed.
+    """
+    subject = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if subject is None:
+        raise ValueError(f"subject task {task_id} does not exist on this board")
+    if subject["status"] not in {"done", "archived"}:
+        raise ValueError("state evidence may only be appended to a terminal subject task")
+    run = conn.execute(
+        "SELECT task_id, profile, status, ended_at, outcome FROM task_runs WHERE id = ?",
+        (int(issuer_run_id),),
+    ).fetchone()
+    if run is None:
+        raise ValueError(f"issuer run {issuer_run_id} does not exist on this board")
+    if run["task_id"] != issuer_task_id:
+        raise ValueError("issuer task does not match issuer run")
+    if not issuer_profile or run["profile"] != issuer_profile:
+        raise ValueError("issuer profile does not match issuer run")
+
+    issuer_task = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (issuer_task_id,),
+    ).fetchone()
+    if issuer_task is None:
+        raise ValueError("issuer task does not exist on this board")
+    if issuer_task_id == task_id:
+        latest = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? "
+            "ORDER BY started_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        retained_completion_authority = (
+            allow_retained_completion_authority
+            and run["ended_at"] is not None
+            and run["outcome"] == "completed"
+            and latest is not None
+            and int(latest["id"]) == issuer_run_id
+        )
+        if retained_completion_authority:
+            return
+        if allow_retained_completion_authority:
+            raise ValueError("retained authority requires the latest completed run")
+        raise ValueError("state append requires an active claimed run from an evidence task")
+
+    active = (
+        issuer_task["status"] == "running"
+        and issuer_task["current_run_id"] == issuer_run_id
+        and run["ended_at"] is None
+    )
+    if not active:
+        raise ValueError("separate evidence issuer requires an active claimed run")
+    authorized = conn.execute(
+        """
+        WITH RECURSIVE ancestors(task_id) AS (
+            SELECT parent_id FROM task_links WHERE child_id = ?
+            UNION
+            SELECT links.parent_id
+              FROM task_links AS links
+              JOIN ancestors ON links.child_id = ancestors.task_id
+        )
+        SELECT 1 FROM ancestors WHERE task_id = ? LIMIT 1
+        """,
+        (issuer_task_id, task_id),
+    ).fetchone()
+    if authorized is None:
+        raise ValueError("issuer run is not authorized for the subject task")
+
+
+def _validate_state_event_append(
+    conn: sqlite3.Connection,
+    task_id: str,
+    events: list[dict],
+    *,
+    issuer_run_id: int,
+    issuer_task_id: str,
+    issuer_profile: str,
+    allow_retained_completion_authority: bool = False,
+) -> None:
+    _authorize_state_event_issuer(
+        conn,
+        task_id,
+        issuer_run_id=issuer_run_id,
+        issuer_task_id=issuer_task_id,
+        issuer_profile=issuer_profile,
+        allow_retained_completion_authority=allow_retained_completion_authority,
+    )
+    if not events:
+        raise ValueError("state_events must contain at least one event")
+    mismatched = {
+        event["issued_by_run"]
+        for event in events
+        if event["issued_by_run"] != issuer_run_id
+    }
+    if mismatched:
+        raise ValueError(
+            f"issued_by_run must match issuer run {issuer_run_id}; got {sorted(mismatched)}"
+        )
+    receipt_ids = [event["receipt_id"] for event in events]
+    if len(receipt_ids) != len(set(receipt_ids)):
+        raise ValueError("receipt replay detected within state event batch")
+    placeholders = ",".join("?" for _ in receipt_ids)
+    replay = conn.execute(
+        f"SELECT receipt_id FROM task_run_state_events "
+        f"WHERE receipt_id IN ({placeholders}) LIMIT 1",
+        tuple(receipt_ids),
+    ).fetchone()
+    if replay is not None:
+        raise ValueError(f"receipt replay detected: {replay['receipt_id']}")
+    occurred = [event["occurred_at"] for event in events]
+    if occurred != sorted(occurred):
+        raise ValueError("state events must be in chronological order")
+    latest = conn.execute(
+        "SELECT MAX(occurred_at) AS latest FROM task_run_state_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()["latest"]
+    if latest is not None and occurred[0] < int(latest):
+        raise ValueError("state events must remain chronological with existing evidence")
+
+
+def _insert_task_state_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    issuer_run_id: int,
+    event: dict,
+) -> None:
+    conn.execute(
+        "INSERT INTO task_run_state_events ("
+        "task_id, run_id, state, value, occurred_at, receipt_id, "
+        "issued_by_run, manifest_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id, issuer_run_id, event["state"], json.dumps(event["value"]),
+            event["occurred_at"], event["receipt_id"], event["issued_by_run"],
+            event["manifest_id"],
+        ),
+    )
+
+
+def _append_task_state_events_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    events: list[dict],
+    *,
+    issuer_run_id: int,
+    issuer_task_id: str,
+    issuer_profile: str,
+    allow_retained_completion_authority: bool = False,
+) -> int:
+    """Validate and insert state rows inside the caller's open transaction."""
+    _validate_state_event_append(
+        conn,
+        task_id,
+        events,
+        issuer_run_id=issuer_run_id,
+        issuer_task_id=issuer_task_id,
+        issuer_profile=issuer_profile,
+        allow_retained_completion_authority=allow_retained_completion_authority,
+    )
+    for event in events:
+        _insert_task_state_event(conn, task_id, issuer_run_id, event)
+    return len(events)
+
+
+def append_task_state_events(
+    conn: sqlite3.Connection,
+    task_id: str,
+    state_events: list[dict],
+    *,
+    issuer_run_id: int,
+    issuer_task_id: str,
+    issuer_profile: str,
+) -> int:
+    """Atomically append authorized state evidence without mutating history.
+
+    The operation inserts only ``task_run_state_events`` rows.  It never
+    reopens a task, changes ``completed_at``/``current_run_id``, closes or
+    synthesizes a run, or writes lifecycle events.
+    """
+    from hermes_cli.kanban_verdicts import normalize_state_events
+
+    normalized = normalize_state_events(state_events)
+    with write_txn(conn):
+        return _append_task_state_events_in_txn(
+            conn,
+            task_id,
+            normalized,
+            issuer_run_id=int(issuer_run_id),
+            issuer_task_id=issuer_task_id,
+            issuer_profile=issuer_profile,
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5367,6 +5645,8 @@ def complete_task(
     result: Optional[str] = None,
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
+    verdicts: Optional[list[dict]] = None,
+    state_events: Optional[list[dict]] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
@@ -5403,6 +5683,80 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    from hermes_cli.kanban_verdicts import (
+        normalize_state_events,
+        normalize_verdicts,
+        validate_typed_completion_evidence,
+    )
+    # Validate before any task/run mutation. This is the rollback boundary for
+    # malformed or privacy-unsafe typed payloads.
+    normalized_verdicts = normalize_verdicts(verdicts) if verdicts is not None else None
+    normalized_state_events = normalize_state_events(state_events)
+    typed_run_id = _current_run_id(conn, task_id)
+    task_before = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    # Backward-compatible terminal call: the immutable candidate exposed typed
+    # state writes only through complete_task. Delegate that call to the named
+    # append primitive and leave the already-completed task/run/event history
+    # byte-for-byte unchanged.
+    if (
+        task_before is not None
+        and task_before["status"] in {"done", "archived"}
+        and normalized_state_events
+        and not normalized_verdicts
+    ):
+        if result is not None or metadata is not None or created_cards or expected_run_id is not None:
+            raise ValueError(
+                "terminal state append compatibility only accepts summary and state_events"
+            )
+        issuer_ids = {event["issued_by_run"] for event in normalized_state_events}
+        if len(issuer_ids) != 1:
+            raise ValueError("terminal state append requires exactly one issuer run")
+        issuer_run_id = next(iter(issuer_ids))
+        issuer = conn.execute(
+            "SELECT task_id, profile FROM task_runs WHERE id = ?", (issuer_run_id,),
+        ).fetchone()
+        if issuer is None:
+            raise ValueError(f"issuer run {issuer_run_id} does not exist on this board")
+        with write_txn(conn):
+            _append_task_state_events_in_txn(
+                conn,
+                task_id,
+                normalized_state_events,
+                issuer_run_id=issuer_run_id,
+                issuer_task_id=issuer["task_id"],
+                issuer_profile=issuer["profile"],
+                allow_retained_completion_authority=True,
+            )
+        return True
+    completion_policy = str(
+        read_board_metadata().get("completion_policy") or "legacy"
+    ).strip().lower()
+    if completion_policy == "typed_v1":
+        if typed_run_id is None:
+            raise ValueError(
+                "typed_v1 completion requires an active claimed run; "
+                "claim the card and submit typed terminal evidence"
+            )
+        validate_typed_completion_evidence(
+            normalized_verdicts,
+            normalized_state_events,
+        )
+    if normalized_verdicts or normalized_state_events:
+        if typed_run_id is None:
+            raise ValueError("typed verdict/state evidence requires an active claimed run")
+        mismatched_issuers = [
+            item["issued_by_run"]
+            for item in [*(normalized_verdicts or []), *normalized_state_events]
+            if item["issued_by_run"] != typed_run_id
+        ]
+        if mismatched_issuers:
+            raise ValueError(
+                f"issued_by_run must match active run {typed_run_id}; "
+                f"got {sorted(set(mismatched_issuers))}"
+            )
+
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -5504,6 +5858,7 @@ def complete_task(
             outcome="completed", status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
+            verdicts=normalized_verdicts,
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
@@ -5511,6 +5866,7 @@ def complete_task(
         # attempt history instead of silently lost.
         if run_id is None and (
             summary or metadata or result or prior_status == "review"
+            or normalized_verdicts or normalized_state_events
         ):
             synth_summary = summary if summary is not None else result
             synth_metadata = metadata
@@ -5525,6 +5881,20 @@ def complete_task(
                 outcome="completed",
                 summary=synth_summary,
                 metadata=synth_metadata,
+                verdicts=normalized_verdicts,
+            )
+        if normalized_state_events:
+            issuer = conn.execute(
+                "SELECT task_id, profile FROM task_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+            _append_task_state_events_in_txn(
+                conn,
+                task_id,
+                normalized_state_events,
+                issuer_run_id=run_id,
+                issuer_task_id=issuer["task_id"],
+                issuer_profile=issuer["profile"],
+                allow_retained_completion_authority=True,
             )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
@@ -11074,6 +11444,30 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
 
+    if str(read_board_metadata().get("completion_policy") or "legacy") == "typed_v1":
+        active_run_id = _current_run_id(conn, task_id)
+        lines.append("## Required terminal evidence")
+        lines.append(
+            "This board uses fail-closed `typed_v1` completion. Plain prose, "
+            "PASS markers, and an `unknown` state cannot close this card."
+        )
+        lines.append(f"Current issuer run: `{active_run_id}`")
+        lines.append(
+            "`kanban_complete` must include at least one effective `product`, "
+            "`design`, or `release` verdict whose value is `pass` or "
+            "`not_applicable`. Set every verdict/state `issued_by_run` to the "
+            "current issuer run and bind every state `manifest_id` to a "
+            "verdict `evidence_manifest_id`."
+        )
+        lines.append(
+            "Include exactly one final state event for each rung: local, tested, "
+            "committed, pushed, reviewed, merged, released, deployed, "
+            "use_verified, runtime_healthy. Each value must be `true` or "
+            "`not_applicable`; otherwise keep the card open and route the "
+            "remaining work. Receipt IDs must be unique and evidence-backed."
+        )
+        lines.append("")
+
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
@@ -12090,6 +12484,51 @@ def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
         (task_id,),
     ).fetchone()
     return Run.from_row(row) if row else None
+
+
+def list_state_events(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    """Return append-only release/runtime observations in evidence order."""
+    rows = conn.execute(
+        "SELECT * FROM task_run_state_events WHERE task_id = ? "
+        "ORDER BY occurred_at, id",
+        (task_id,),
+    ).fetchall()
+    result: list[dict] = []
+    for row in rows:
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError):
+            value = "unknown"
+        result.append({
+            "id": int(row["id"]),
+            "task_id": row["task_id"],
+            "run_id": int(row["run_id"]),
+            "state": row["state"],
+            "value": value,
+            "occurred_at": int(row["occurred_at"]),
+            "receipt_id": row["receipt_id"],
+            "issued_by_run": int(row["issued_by_run"]),
+            **({"manifest_id": row["manifest_id"]} if row["manifest_id"] is not None else {}),
+        })
+    return result
+
+
+def classify_task_outcome(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Prefer effective typed records; expose prose fallback as heuristic-only."""
+    from hermes_cli.kanban_verdicts import classify_verdicts
+    task = get_task(conn, task_id)
+    runs = list_runs(conn, task_id)
+    verdicts = [record for run in runs for record in run.verdicts]
+    legacy_text = "\n".join(
+        part
+        for part in (
+            [task.result if task else None]
+            + [run.summary for run in runs]
+            + [run.error for run in runs]
+        )
+        if part
+    )
+    return classify_verdicts(verdicts, legacy_text=legacy_text)
 
 
 def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:

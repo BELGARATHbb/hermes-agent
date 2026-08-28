@@ -3706,6 +3706,7 @@
           homeBusy: homeBusy,
           onToggleHomeSub: toggleHomeSubscription,
           onRefresh: props.onRefresh,
+          onStateAppended: function () { load(); props.onRefresh(); },
           onUpload: handleUpload,
           onDeleteAttachment: handleDeleteAttachment,
           uploadBusy: uploadBusy,
@@ -4074,8 +4075,155 @@
         }),
       ),
       h(WorkerLogSection, { taskId: t.id, boardSlug: props.boardSlug }),
+      h(VerdictLedgerSection, {
+        classification: props.data.trust_outcome,
+        stateEvents: props.data.state_events || [],
+      }),
+      (t.status === "done" || t.status === "archived")
+        ? h(StateEventAppendForm, {
+            taskId: t.id,
+            boardSlug: props.boardSlug,
+            onAppended: props.onStateAppended,
+          })
+        : null,
       h(RunHistorySection, { runs: props.data.runs || [] }),
     );
+  }
+
+  function StateEventAppendForm(props) {
+    const [state, setState] = useState("pushed");
+    const [value, setValue] = useState("true");
+    const [occurredAt, setOccurredAt] = useState(String(Math.floor(Date.now() / 1000)));
+    const [receiptId, setReceiptId] = useState("");
+    const [manifestId, setManifestId] = useState("");
+    const [issuerRunId, setIssuerRunId] = useState("");
+    const [issuerTaskId, setIssuerTaskId] = useState("");
+    const [issuerProfile, setIssuerProfile] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [message, setMessage] = useState(null);
+
+    function submit(event) {
+      event.preventDefault();
+      const runId = Number(issuerRunId);
+      const timestamp = Number(occurredAt);
+      if (!Number.isInteger(runId) || runId < 1 || !Number.isInteger(timestamp) || timestamp < 0) {
+        setMessage({ ok: false, text: "Issuer run and occurred-at must be valid integers." });
+        return Promise.resolve();
+      }
+      if (!issuerTaskId.trim() || !issuerProfile.trim() || !receiptId.trim() || !manifestId.trim()) {
+        setMessage({ ok: false, text: "Issuer task/profile, receipt, and manifest are required." });
+        return Promise.resolve();
+      }
+      const typedValue = value === "true" ? true : (value === "false" ? false : value);
+      const body = {
+        issuer_run_id: runId,
+        issuer_task_id: issuerTaskId.trim(),
+        issuer_profile: issuerProfile.trim(),
+        state_events: [{
+          state: state,
+          value: typedValue,
+          occurred_at: timestamp,
+          receipt_id: receiptId.trim(),
+          issued_by_run: runId,
+          manifest_id: manifestId.trim(),
+        }],
+      };
+      setBusy(true);
+      setMessage(null);
+      return SDK.fetchJSON(withBoard(
+        `${API}/tasks/${encodeURIComponent(props.taskId)}/state-events`,
+        props.boardSlug,
+      ), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).then(function (response) {
+        setMessage({ ok: true, text: `Appended ${response.inserted || 0} state event.` });
+        setReceiptId("");
+        setManifestId("");
+        if (props.onAppended) props.onAppended(response);
+      }).catch(function (error) {
+        setMessage({ ok: false, text: parseApiErrorMessage(error) });
+      }).finally(function () {
+        setBusy(false);
+      });
+    }
+
+    function input(name, valueNow, setter, placeholder, type) {
+      return h(Input, {
+        name: name,
+        type: type || "text",
+        value: valueNow,
+        placeholder: placeholder,
+        onChange: function (event) { setter(event.target.value); },
+        className: "h-8 text-sm",
+      });
+    }
+
+    return h("form", { className: "hermes-kanban-section", onSubmit: submit },
+      h("div", { className: "hermes-kanban-section-head" }, "Append verified state receipt"),
+      h("div", { className: "text-xs text-muted-foreground" },
+        "Requires an authorized claimed issuer run. The task and prior history are never reopened or rewritten."),
+      h("div", { className: "grid grid-cols-2 gap-2 mt-2" },
+        h("select", {
+          name: "state", value: state,
+          onChange: function (event) { setState(event.target.value); },
+          className: "h-8 text-sm",
+        }, ["local", "tested", "committed", "pushed", "reviewed", "merged", "released",
+          "deployed", "use_verified", "runtime_healthy"].map(function (item) {
+          return h("option", { key: item, value: item }, item);
+        })),
+        h("select", {
+          name: "value", value: value,
+          onChange: function (event) { setValue(event.target.value); },
+          className: "h-8 text-sm",
+        }, ["true", "false", "unknown", "not_applicable"].map(function (item) {
+          return h("option", { key: item, value: item }, item);
+        })),
+        input("issuer_task_id", issuerTaskId, setIssuerTaskId, "issuer task id"),
+        input("issuer_run_id", issuerRunId, setIssuerRunId, "issuer run id", "number"),
+        input("issuer_profile", issuerProfile, setIssuerProfile, "issuer profile"),
+        input("occurred_at", occurredAt, setOccurredAt, "occurred-at epoch", "number"),
+        input("receipt_id", receiptId, setReceiptId, "receipt id"),
+        input("manifest_id", manifestId, setManifestId, "manifest id"),
+      ),
+      h(Button, { type: "submit", size: "sm", disabled: busy, className: "mt-2" },
+        busy ? "Appending…" : "Append receipt"),
+      message ? h("div", {
+        role: "alert",
+        className: message.ok ? "hermes-kanban-msg-ok" : "hermes-kanban-msg-err",
+      }, message.text) : null,
+    );
+  }
+
+  function VerdictLedgerSection(props) {
+    const classification = props.classification;
+    if (!classification) return null;
+    const subjects = classification.subjects || {};
+    const subjectRows = Object.keys(subjects).sort().map(function (subject) {
+      return h("div", { key: subject, className: "hermes-kanban-run-head" },
+        h("span", { className: "hermes-kanban-run-profile" }, subject),
+        h("span", { className: "hermes-kanban-run-outcome" }, subjects[subject]));
+    });
+    const stateRows = (props.stateEvents || []).map(function (event) {
+      return h("div", { key: event.id, className: "hermes-kanban-run-head" },
+        h("span", { className: "hermes-kanban-run-profile" }, event.state),
+        h("span", { className: "hermes-kanban-run-outcome" }, String(event.value)),
+        event.receipt_id
+          ? h("span", { className: "hermes-kanban-run-ago" }, event.receipt_id)
+          : null);
+    });
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" }, "Trust / Outcome"),
+      h("div", { className: "hermes-kanban-run" },
+        h("div", { className: "hermes-kanban-run-head" },
+          h("span", { className: "hermes-kanban-run-outcome" }, classification.outcome),
+          h("span", { className: "hermes-kanban-run-profile" },
+            classification.source === "legacy_heuristic"
+              ? "legacy prose — heuristic only"
+              : classification.source)),
+        subjectRows,
+        stateRows));
   }
 
   // Per-attempt history. Closed runs first (most recent last), then the
@@ -4780,6 +4928,10 @@
   // -------------------------------------------------------------------------
   // Register
   // -------------------------------------------------------------------------
+
+  // The component property lets non-browser unit tests exercise the real
+  // bundled form without a second UI implementation or source-text assertions.
+  KanbanPage.StateEventAppendForm = StateEventAppendForm;
 
   if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
     window.__HERMES_PLUGINS__.register("kanban", KanbanPage);

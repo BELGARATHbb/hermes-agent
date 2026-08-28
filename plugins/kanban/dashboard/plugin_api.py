@@ -47,7 +47,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -231,6 +231,7 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
         "outcome": r.outcome,
         "summary": r.summary,
         "metadata": r.metadata,
+        "verdicts": r.verdicts,
         "error": r.error,
     }
 
@@ -587,6 +588,47 @@ def get_task(
                     state_name=run_state_name,
                 )
             ],
+            "state_events": kanban_db.list_state_events(conn, task_id),
+            "trust_outcome": kanban_db.classify_task_outcome(conn, task_id),
+        }
+    finally:
+        conn.close()
+
+
+class AppendStateEventsBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    issuer_run_id: int
+    issuer_task_id: str
+    issuer_profile: str
+    state_events: list[dict[str, Any]]
+
+
+@router.post("/tasks/{task_id}/state-events")
+def append_task_state_events(
+    task_id: str,
+    payload: AppendStateEventsBody,
+    board: Optional[str] = Query(None),
+):
+    """Append authenticated typed evidence without reopening task history."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        try:
+            inserted = kanban_db.append_task_state_events(
+                conn,
+                task_id,
+                payload.state_events,
+                issuer_run_id=payload.issuer_run_id,
+                issuer_task_id=payload.issuer_task_id,
+                issuer_profile=payload.issuer_profile,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "task_id": task_id,
+            "inserted": inserted,
+            "state_events": kanban_db.list_state_events(conn, task_id),
         }
     finally:
         conn.close()
@@ -839,6 +881,8 @@ class UpdateTaskBody(BaseModel):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    verdicts: Optional[list[dict]] = None
+    state_events: Optional[list[dict]] = None
     # Per-task model/provider override (the board's model dropdown).
     # ``model_override=""`` clears both. ``clear_model_override=True`` is
     # the explicit clear signal — needed because Optional[str]=None means
@@ -898,12 +942,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                        verdicts=payload.verdicts,
+                        state_events=payload.state_events,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc))
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
