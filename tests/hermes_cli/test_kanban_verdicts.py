@@ -166,8 +166,9 @@ def test_unknown_and_not_applicable_states_remain_distinct():
     assert [event["value"] for event in events] == ["unknown", "not_applicable"]
 
 
-def test_json_decoded_not_applicable_state_is_accepted_by_value():
-    value = json.loads('{"value":"not_applicable"}')["value"]
+@pytest.mark.parametrize("value", [True, False, "unknown", "not_applicable"])
+def test_json_decoded_state_values_are_accepted_by_type_and_value(value):
+    value = json.loads(json.dumps({"value": value}))["value"]
 
     events = normalize_state_events([{
         "state": "deployed",
@@ -178,13 +179,17 @@ def test_json_decoded_not_applicable_state_is_accepted_by_value():
         "manifest_id": "manifest-json",
     }])
 
-    assert events[0]["value"] == "not_applicable"
+    assert events[0]["value"] == value
 
 
-def test_integer_state_values_do_not_alias_booleans():
+@pytest.mark.parametrize(
+    "value",
+    [0, 1, None, 0.0, 1.0, [], {}, "pending"],
+)
+def test_invalid_json_state_values_do_not_alias_valid_dispositions(value):
     event = {
         "state": "deployed",
-        "value": 1,
+        "value": value,
         "occurred_at": 1_787_500_002,
         "receipt_id": "receipt-int",
         "issued_by_run": 41,
@@ -373,6 +378,35 @@ def test_typed_v1_policy_closes_only_with_bound_terminal_evidence(conn):
 
     assert kb.get_task(conn, task_id).status == "done"
     assert len(kb.list_state_events(conn, task_id)) == len(STATE_NAMES)
+
+
+def test_typed_v1_policy_closes_after_json_transport_with_not_applicable_rungs(conn):
+    kb.write_board_metadata(None, completion_policy="typed_v1")
+    task_id = kb.create_task(conn, title="transported proof", assignee="worker")
+    kb.claim_task(conn, task_id)
+    run_id = kb.latest_run(conn, task_id).id
+    verdict = _verdict("accepted-json", "product", "pass")
+    verdict["issued_by_run"] = run_id
+    states = _terminal_states(run_id)
+    for event in states:
+        if event["state"] in {"merged", "released", "deployed"}:
+            event["value"] = "not_applicable"
+    transported = json.loads(json.dumps(states))
+
+    assert kb.complete_task(
+        conn,
+        task_id,
+        summary="all applicable rungs proven after JSON transport",
+        verdicts=[verdict],
+        state_events=transported,
+        expected_run_id=run_id,
+    )
+
+    assert kb.get_task(conn, task_id).status == "done"
+    assert {
+        event["state"]: event["value"]
+        for event in kb.list_state_events(conn, task_id)
+    }["deployed"] == "not_applicable"
 
 
 def test_typed_v1_worker_context_explains_exact_terminal_contract(conn):
